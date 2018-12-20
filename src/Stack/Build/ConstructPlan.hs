@@ -90,9 +90,15 @@ combineMap = Map.mergeWithKey
     (fmap (uncurry PIOnlyInstalled))
 
 data AddDepRes
-    = ADRToInstall Task
+    = ADRToFullInstall Task
+    | ADRToLibraryInstall Task (M ())
     | ADRFound InstallLocation Installed
-    deriving Show
+
+instance Show AddDepRes where
+  show (ADRToFullInstall t) = "ADRToFullInstall (" ++ show t  ++ ")"
+  show (ADRToLibraryInstall t _) = "ADRToLibraryInstall (" ++ show t ++ ", <<postponed>>)"
+  show (ADRFound il i) = "ADRFound (" ++ show il ++ ", " ++ show i ++ ")"
+  
 
 type ParentMap = MonoidMap PackageName (First Version, [(PackageIdentifier, VersionRange)])
 
@@ -179,8 +185,13 @@ constructPlan baseConfigOpts0 localDumpPkgs loadPackage0 sourceMap installedMap 
     econfig <- view envConfigL
     sources <- getSources
 
-    let onTarget = void . addDep False
-    let inner = mapM_ onTarget $ Map.keys (smtTargets $ smTargets sourceMap)
+    let inner = do
+          mapM_ (addDep False) (Map.keys $ smtTargets $ smTargets sourceMap)
+          m <- get
+          for_ m $ \adr ->
+            case adr of
+              Right (ADRToLibraryInstall _t final) -> final
+              _ -> return ()
     let ctx = mkCtx econfig sources
     ((), m, W efinals installExes dirtyReason deps warnings parents) <-
         liftIO $ runRWST inner ctx M.empty
@@ -193,7 +204,8 @@ constructPlan baseConfigOpts0 localDumpPkgs loadPackage0 sourceMap installedMap 
     if null errs
         then do
             let toTask (_, ADRFound _ _) = Nothing
-                toTask (name, ADRToInstall task) = Just (name, task)
+                toTask (name, ADRToFullInstall task) = Just (name, task)
+                toTask (_name, ADRToLibraryInstall _ _) = error "task is supposed to be finalized at this point"
                 tasks = M.fromList $ mapMaybe toTask adrs
                 takeSubset =
                     case boptsCLIBuildSubset $ bcoBuildOptsCLI baseConfigOpts0 of
@@ -354,35 +366,55 @@ mkUnregisterLocal tasks dirtyReason localDumpPkgs sourceMap initialBuildSteps =
 -- benchmarks. If @isAllInOne@ is 'True' (the common case), then all of
 -- these should have already been taken care of as part of the build
 -- step.
-addFinal :: LocalPackage -> Package -> Bool -> Bool -> M ()
-addFinal lp package isAllInOne buildHaddocks = do
-    depsRes <- addPackageDeps False package
-    res <- case depsRes of
-        Left e -> return $ Left e
-        Right (missing, present, _minLoc) -> do
-            ctx <- ask
-            return $ Right Task
-                { taskProvides = PackageIdentifier
-                    (packageName package)
-                    (packageVersion package)
-                , taskConfigOpts = TaskConfigOpts missing $ \missing' ->
-                    let allDeps = Map.union present missing'
-                     in configureOpts
-                            (view envConfigL ctx)
-                            (baseConfigOpts ctx)
-                            allDeps
-                            True -- local
-                            Mutable
-                            package
-                , taskBuildHaddock = buildHaddocks
-                , taskPresent = present
-                , taskType = TTLocalMutable lp
-                , taskAllInOne = isAllInOne
-                , taskCachePkgSrc = CacheSrcLocal (toFilePath (parent (lpCabalFile lp)))
-                , taskAnyMissing = not $ Set.null missing
-                , taskBuildTypeConfig = packageBuildTypeConfig package
-                }
-    tell mempty { wFinals = Map.singleton (packageName package) res }
+addFinal :: LocalPackage -> Package -> Bool -> Bool -> Maybe Task -> Either ConstructPlanException AddDepRes -> M (Either ConstructPlanException AddDepRes)
+addFinal lp package isAllInOne buildHaddocks mTask parentAdr =
+    case mTask of
+        Just task -> do
+            go AllowCycles $ do
+                let final = do
+                        res <- goWithNoCycles
+                        updateLibMap (packageName package) res
+                return $ Right (ADRToLibraryInstall task final)
+        Nothing -> goWithNoCycles
+  where
+    goWithNoCycles = go NoCycles noPartialWithNoCycles
+    recordAndReturn res = do
+        tell mempty {wFinals = Map.singleton (packageName package) res}
+        return parentAdr
+    go allowCycles onPartial = do
+        depsRes <- addPackageDeps False allowCycles package
+        case depsRes of
+            Left e -> recordAndReturn $ Left e
+            Right (False, (missing, present, _minLoc)) -> do
+                ctx <- ask
+                recordAndReturn $ Right
+                        Task
+                            { taskProvides =
+                                  PackageIdentifier
+                                      (packageName package)
+                                      (packageVersion package)
+                            , taskConfigOpts =
+                                  TaskConfigOpts missing $ \missing' ->
+                                      let allDeps = Map.union present missing'
+                                       in configureOpts
+                                              (view envConfigL ctx)
+                                              (baseConfigOpts ctx)
+                                              allDeps
+                                              True -- local
+                                              Mutable
+                                              package
+                            , taskBuildHaddock = buildHaddocks
+                            , taskPresent = present
+                            , taskType = TTLocalMutable lp
+                            , taskAllInOne = isAllInOne
+                            , taskCachePkgSrc =
+                                  CacheSrcLocal
+                                      (toFilePath (parent (lpCabalFile lp)))
+                            , taskAnyMissing = not $ Set.null missing
+                            , taskBuildTypeConfig =
+                                  packageBuildTypeConfig package
+                            }
+            Right (True, _) -> onPartial
 
 -- | Given a 'PackageName', adds all of the build tasks to build the
 -- package, if needed.
@@ -489,31 +521,31 @@ installPackage treatAsDep name ps minstalled = do
         PSRemote pkgLoc _version _fromSnaphot cp -> do
             planDebug $ "installPackage: Doing all-in-one build for upstream package " ++ show name
             package <- loadPackage ctx pkgLoc (cpFlags cp) (cpGhcOptions cp)
-            resolveDepsAndInstall True treatAsDep (cpHaddocks cp) ps package minstalled
+            resolveDepsAndInstall treatAsDep (cpHaddocks cp) ps package minstalled Nothing
         PSFilePath lp ->
             case lpTestBench lp of
                 Nothing -> do
                     planDebug $ "installPackage: No test / bench component for " ++ show name ++ " so doing an all-in-one build."
-                    resolveDepsAndInstall True treatAsDep (lpBuildHaddocks lp) ps (lpPackage lp) minstalled
+                    resolveDepsAndInstall treatAsDep (lpBuildHaddocks lp) ps (lpPackage lp) minstalled Nothing
                 Just tb -> do
                     -- Attempt to find a plan which performs an all-in-one
                     -- build.  Ignore the writer action + reset the state if
                     -- it fails.
                     s <- get
                     res <- pass $ do
-                        res <- addPackageDeps treatAsDep tb
+                        res <- addPackageDeps treatAsDep NoCycles tb
                         let writerFunc w = case res of
                                 Left _ -> mempty
                                 _ -> w
                         return (res, writerFunc)
                     case res of
-                        Right deps -> do
+                        Right (partial, deps) -> do
+                          when partial noPartialWithNoCycles
                           planDebug $ "installPackage: For " ++ show name ++ ", successfully added package deps"
                           adr <- installPackageGivenDeps True False ps tb minstalled deps
                           -- FIXME: this redundantly adds the deps (but
                           -- they'll all just get looked up in the map)
-                          addFinal lp tb True False
-                          return $ Right adr
+                          addFinal lp tb True False Nothing $ Right adr
                         Left _ -> do
                             -- Reset the state to how it was before
                             -- attempting to find an all-in-one build
@@ -522,26 +554,40 @@ installPackage treatAsDep name ps minstalled = do
                             put s
                             -- Otherwise, fall back on building the
                             -- tests / benchmarks in a separate step.
-                            res' <- resolveDepsAndInstall False treatAsDep (lpBuildHaddocks lp) ps (lpPackage lp) minstalled
-                            when (isRight res') $ do
+                            resolveDepsAndInstall treatAsDep (lpBuildHaddocks lp) ps (lpPackage lp) minstalled $ Just $ \adr -> do
+                                let res' = Right adr
                                 -- Insert it into the map so that it's
                                 -- available for addFinal.
                                 updateLibMap name res'
-                                addFinal lp tb False False
-                            return res'
+                                case adr of
+                                  ADRToFullInstall t -> do
+                                    addFinal lp tb False False (Just t) res'
+                                  _ ->
+                                    addFinal lp tb False False Nothing res'
 
 resolveDepsAndInstall :: Bool
-                      -> Bool
                       -> Bool
                       -> PackageSource
                       -> Package
                       -> Maybe Installed
+                      -> Maybe (AddDepRes -> M (Either ConstructPlanException AddDepRes))
                       -> M (Either ConstructPlanException AddDepRes)
-resolveDepsAndInstall isAllInOne treatAsDep buildHaddocks ps package minstalled = do
-    res <- addPackageDeps treatAsDep package
+resolveDepsAndInstall treatAsDep buildHaddocks ps package minstalled mOnPartial = do
+    let allowCycles = case mOnPartial of
+          Just _ -> AllowCycles
+          Nothing -> NoCycles
+    res <- addPackageDeps treatAsDep allowCycles package
     case res of
         Left err -> return $ Left err
-        Right deps -> liftM Right $ installPackageGivenDeps isAllInOne buildHaddocks ps package minstalled deps
+        Right (False, deps) -> do
+          install <- installPackageGivenDeps True buildHaddocks ps package minstalled deps
+          return $ Right install
+        Right (True, deps) -> do
+          case mOnPartial of
+            Just onPartial -> do
+              install <- installPackageGivenDeps False buildHaddocks ps package minstalled deps
+              onPartial install
+            Nothing -> noPartialWithNoCycles
 
 -- | Checks if we need to install the given 'Package', given the results
 -- of 'addPackageDeps'. If dependencies are missing, the package is
@@ -571,7 +617,7 @@ installPackageGivenDeps isAllInOne buildHaddocks ps package minstalled (missing,
         mutable = installLocationIsMutable loc <> minMutable
     return $ case mRightVersionInstalled of
         Just installed -> ADRFound loc installed
-        Nothing -> ADRToInstall Task
+        Nothing -> ADRToFullInstall Task
             { taskProvides = PackageIdentifier
                 (packageName package)
                 (packageVersion package)
@@ -615,6 +661,14 @@ addEllipsis t
     | T.length t < 100 = t
     | otherwise = T.take 97 t <> "..."
 
+data AllowCycles
+    = AllowCycles
+    | NoCycles
+    deriving (Show, Eq)
+
+noPartialWithNoCycles :: a
+noPartialWithNoCycles = error "Install can't be partial with no cycles allowed"
+
 -- | Given a package, recurses into all of its dependencies. The results
 -- indicate which packages are missing, meaning that their 'GhcPkgId's
 -- will be figured out during the build, after they've been built. The
@@ -626,8 +680,9 @@ addEllipsis t
 -- is 'Snap', then it can either be installed locally or in the
 -- snapshot.
 addPackageDeps :: Bool -- ^ is this being used by a dependency?
-               -> Package -> M (Either ConstructPlanException (Set PackageIdentifier, Map PackageIdentifier GhcPkgId, IsMutable))
-addPackageDeps treatAsDep package = do
+               -> AllowCycles
+               -> Package -> M (Either ConstructPlanException (Bool, (Set PackageIdentifier, Map PackageIdentifier GhcPkgId, IsMutable)))
+addPackageDeps treatAsDep allowCycles package = do
     ctx <- ask
     deps' <- packageDepsWithTools package
     deps <- forM (Map.toList deps') $ \(depname, DepValue range depType) -> do
@@ -695,7 +750,9 @@ addPackageDeps treatAsDep package = do
                                     else return False
                 if inRange
                     then case adr of
-                        ADRToInstall task -> return $ Right
+                        ADRToLibraryInstall task _postponed -> return $ Right
+                            (Set.singleton $ taskProvides task, Map.empty, taskTargetIsMutable task)
+                        ADRToFullInstall task -> return $ Right
                             (Set.singleton $ taskProvides task, Map.empty, taskTargetIsMutable task)
                         ADRFound loc (Executable _) -> return $ Right
                             (Set.empty, Map.empty, installLocationIsMutable loc)
@@ -710,12 +767,16 @@ addPackageDeps treatAsDep package = do
         -- package must be installed locally. Otherwise the result is
         -- 'Snap', indicating that the parent can either be installed
         -- locally or in the snapshot.
-        ([], pairs) -> return $ Right $ mconcat pairs
-        (errs, _) -> return $ Left $ DependencyPlanFailures
-            package
-            (Map.fromList errs)
+        ([], pairs) -> return $ Right (False, mconcat pairs)
+        (errs, pairs) ->
+          if allowCycles == AllowCycles && all isCycleErr errs
+          then return $ Right (True, mconcat pairs)
+          else return $ Left $ DependencyPlanFailures package (Map.fromList errs)
   where
-    adrVersion (ADRToInstall task) = pkgVersion $ taskProvides task
+    isCycleErr (_, (_, _, BDDependencyCycleDetected _)) = True
+    isCycleErr _ = False
+    adrVersion (ADRToFullInstall task) = pkgVersion $ taskProvides task
+    adrVersion (ADRToLibraryInstall task _) = pkgVersion $ taskProvides task
     adrVersion (ADRFound _ installed) = installedVersion installed
     -- Update the parents map, for later use in plan construction errors
     -- - see 'getShortestDepsPath'.
@@ -724,7 +785,8 @@ addPackageDeps treatAsDep package = do
         val = (First mversion, [(packageIdentifier package, range)])
 
     adrHasLibrary :: AddDepRes -> Bool
-    adrHasLibrary (ADRToInstall task) = taskHasLibrary task
+    adrHasLibrary (ADRToFullInstall task) = taskHasLibrary task
+    adrHasLibrary (ADRToLibraryInstall task _) = taskHasLibrary task
     adrHasLibrary (ADRFound _ Library{}) = True
     adrHasLibrary (ADRFound _ Executable{}) = False
 
